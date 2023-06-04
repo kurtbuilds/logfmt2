@@ -1,115 +1,95 @@
 #![allow(unused)]
-// https://github.com/rustls/rustls/blob/main/examples/src/bin/tlsserver-mio.rs
-
 mod fast;
+mod humantime;
+mod json;
+mod logfmt;
 
+use std::collections::HashMap;
+use std::fmt::Formatter;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use anyhow::Result;
+use indexmap::IndexMap;
+use crate::logfmt::parse_logfmt;
 
-pub enum ParseStrategy {
-    Json,
-    Logfmt,
-}
+pub struct Parser;
 
-pub enum OuterStrategy {
-    Direct(ParseStrategy),
-    JsonWrapping(ParseStrategy),
+#[derive(Serialize, Deserialize)]
+pub enum DataValue {
+    String(String),
+    F64(f64),
+    I64(i64),
+    Duration(std::time::Duration),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Log {
-    dt: String,
+    dt: Option<String>,
     level: Option<String>,
     #[serde(default)]
     name: Option<String>,
-    message: String,
-    platform: String,
-    #[serde(flatten)]
-    extension: Value
+    pub message: String,
+    platform: Option<String>,
+    #[serde(default, flatten)]
+    extension: Option<Value>,
+    #[serde(default)]
+    data: HashMap<String, DataValue>,
 }
 
 
-fn heuristic_reparse(log: &mut Log) {
-    let mut new_start = 0usize;
-    let mut new_end = None;
-    let line = log.message.as_str();
-    let mut s = line.char_indices().peekable();
-    let mut last_idx = 0;
-    while let Some((i, ch)) = s.next() {
-        match ch {
-            // if char is a space, then we tokenize. check if last word was a level, a logger name, or something else
-            ' ' => {
-                match &line[last_idx..i] {
-                    "INFO" | "WARN" | "WARNING" | "ERROR" | "DEBUG" | "TRACE" => {
-                        if log.level.is_none() {
-                            log.level = Some(line[last_idx..i].to_string());
-                        }
-                        if last_idx == new_start {
-                            new_start = i + 1;
-                        }
-                        last_idx = i + 1;
-                    }
-                    s if s.contains(&['.', ':']) => {
-                        if log.name.is_none() {
-                            log.name = Some(line[last_idx..i].to_string());
-                        }
-                        if last_idx == new_start {
-                            new_start = i + 1;
-                        }
-                        last_idx = i + 1;
-                    }
-                    _ => {
-                        last_idx = i + 1;
-                    }
-                }
-            }
-            // if char is =, then assume its a logfmt key=value pair
-            '=' => {
-                if new_end.is_none() && last_idx > 0 {
-                    new_end = Some(last_idx - 1);
-                }
-                let key = &line[last_idx..i];
-                last_idx = i + 1;
-                'outer: while let Some((i, ch)) = s.next() {
-                    match ch {
-                        ' ' => {
-                            let value = &line[last_idx..i];
-                            last_idx = i + 1;
-                            log.extension[key] = serde_json::Value::String(value.to_string());
-                            break
-                        }
-                        '"' => {
-                            last_idx = i + 1;
-                            while let Some((i, ch)) = s.next() {
-                                match ch {
-                                    '\\' => {
-                                        s.next();
-                                        continue;
-                                    }
-                                    '"' => {
-                                        let value = &line[last_idx..i];
-                                        last_idx = i + 1;
-                                        log.extension[key] = serde_json::Value::String(value.to_string());
-                                        break 'outer;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
+impl Parser {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn parse(&self, line: String) -> Result<Log> {
+        let mut log: Log = serde_json::from_str(&line)?;
+        let log2 = parse_logfmt(std::mem::replace(&mut log.message, "".to_string())).unwrap();
+        log.data.extend(log2.data);
+        log.name = log2.name;
+        if log.level.is_none() {
+            log.level = log2.level;
+        }
+        log.message = log2.message;
+        Ok(log)
+    }
+}
+
+impl std::fmt::Debug for DataValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataValue::String(s) => write!(f, "{:?}", s),
+            DataValue::F64(float) => write!(f, "{}", float),
+            DataValue::I64(int) => write!(f, "{}", int),
+            DataValue::Duration(duration) => write!(f, "{:?}", duration),
         }
     }
-    if let Some(new_end) = new_end {
-        log.message.truncate(new_end);
-    }
-    log.message = log.message.split_off(new_start);
 }
 
+impl std::fmt::Display for DataValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataValue::String(s) => write!(f, "{}", s),
+            DataValue::F64(float) => write!(f, "{}", float),
+            DataValue::I64(int) => write!(f, "{}", int),
+            DataValue::Duration(duration) => write!(f, "{:?}", duration),
+        }
+    }
+}
+
+impl From<&str> for DataValue {
+    fn from(s: &str) -> Self {
+        if let Some(int) = s.parse().ok() {
+            DataValue::I64(int)
+        } else if let Some(float) = s.parse().ok() {
+            DataValue::F64(float)
+        } else if let Ok(duration) = humantime::parse_duration(&s) {
+            DataValue::Duration(duration)
+        } else {
+            DataValue::String(s.to_string())
+        }
+    }
+}
 
 #[cfg(test)]
 mod test {
@@ -117,12 +97,69 @@ mod test {
 
     #[test]
     fn test_logparse() {
-        let a = r#"
-        {"dt":"2023-06-04T01:42:46.344493Z","level":"info","message":"INFO server::onboarding::location_availability: Updated profile with postal code tz=America/Chicago area=- postal_code=76133 req=00djxys6h3gzskbwhwy5zk_pgkx user=1023","platform":"Syslog","syslog":{"appname":"web-2q9fl","facility":"kern","host":"jyve-next","hostname":"jyve-next","msgid":"web-2q9fl","procid":1,"source_ip":"10.0.9.247","version":1}}
+        let json = r#"
+        {"dt":"2023-06-04T01:42:46.344493Z","level":"info","message":"INFO server::onboarding::location_availability: Updated profile with postal code tz=America/Chicago area=- postal_code=10001 req=00djxys6h3gzskbwhwy5zk_pgkx user=7","platform":"Syslog","syslog":{"appname":"web-2q9fl","facility":"kern","host":"jyve-next","hostname":"jyve-next","msgid":"web-2q9fl","procid":1,"source_ip":"10.0.9.247","version":1}}
         "#.trim();
-        let mut s = serde_json::from_str::<Log>(a).unwrap();
-        heuristic_reparse(&mut s);
-        println!("{:#?}", s);
-        assert_eq!(1, 0);
+        _ = "INFO server::onboarding::location_availability: Updated profile with postal code tz=America/Chicago area=- postal_code=76133 req=00djxys6h3gzskbwhwy5zk_pgkx user=7";
+        let log = Parser.parse(json.to_string()).unwrap();
+        assert_eq!(log.level, Some("info".to_string()));
+        assert_eq!(log.name, Some("server::onboarding::location_availability".to_string()));
+        assert_eq!(log.message, "Updated profile with postal code".to_string());
+        assert_eq!(log.data["tz"].to_string(), "America/Chicago");
+        assert_eq!(log.data["area"].to_string(), "-");
+        assert_eq!(log.data["postal_code"].to_string(), "10001");
+        assert_eq!(log.data["req"].to_string(), "00djxys6h3gzskbwhwy5zk_pgkx");
+        assert_eq!(log.data["user"].to_string(), "7");
+    }
+
+    #[test]
+    fn test_render_postgres_log() {
+        let json = r#"
+        {
+    "dt": "2023-06-04T01:41:12.519614Z",
+    "level": "info",
+    "message": "[4-1] user=db_user,db=foo,app=[unknown],client=2.2.2.2,LOG:  disconnection: session time: 0:00:00.153 user=db_user database=foo host=1.1.1.1 port=1",
+    "platform": "Syslog",
+    "syslog": {
+        "appname": "dpg-4hdwr",
+        "facility": "kern",
+        "host": "dpg-ccuecsl3t398coemnq80-a-64647bb8b9-4hdwr",
+        "hostname": "dpg-ccuecsl3t398coemnq80-a-64647bb8b9-4hdwr",
+        "msgid": "dpg-4hdwr",
+        "procid": 1,
+        "source_ip": "10.0.9.247",
+        "version": 1
+    }
+}"#;
+        let log = Parser.parse(json.to_string()).unwrap();
+        assert_eq!(log.data["user"].to_string(), "db_user");
+        assert_eq!(log.data["database"].to_string(), "foo");
+        assert_eq!(log.data["port"].to_string(), "1");
+        assert_eq!(log.data["host"].to_string(), "1.1.1.1");
+        assert!(log.data.get("client").is_none());
+        assert_eq!(log.message, "[4-1] user=db_user,db=foo,app=[unknown],client=2.2.2.2,LOG:  disconnection: session time: 0:00:00.153");
+    }
+
+    #[test]
+    fn test_render_request_completed_log() {
+        let json = r#"
+        {
+    "dt": "2023-06-04T01:41:12.519614Z",
+    "level": "info",
+    "message": "Request completed latency=100.32ms",
+    "platform": "Syslog",
+    "syslog": {
+        "appname": "dpg-4hdwr",
+        "facility": "kern",
+        "host": "dpg-ccuecsl3t398coemnq80-a-64647bb8b9-4hdwr",
+        "hostname": "dpg-ccuecsl3t398coemnq80-a-64647bb8b9-4hdwr",
+        "msgid": "dpg-4hdwr",
+        "procid": 1,
+        "source_ip": "10.0.9.247",
+        "version": 1
+    }
+}"#;
+        let log = Parser.parse(json.to_string()).unwrap();
+        assert_eq!(log.data["latency"].to_string(), "100.32ms");
     }
 }
