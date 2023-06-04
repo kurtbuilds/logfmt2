@@ -12,7 +12,9 @@ use anyhow::Result;
 use indexmap::IndexMap;
 use crate::logfmt::parse_logfmt;
 
-pub struct Parser;
+pub struct Parser {
+     strategy: Strategy,
+}
 
 #[derive(Serialize, Deserialize)]
 pub enum DataValue {
@@ -36,22 +38,59 @@ pub struct Log {
     data: HashMap<String, DataValue>,
 }
 
+#[derive(Debug, Copy, Clone)]
+pub enum InnerStrategy {
+    Json,
+    Logfmt,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum Strategy {
+    Direct(InnerStrategy),
+    Nested {
+        outer: InnerStrategy,
+        inner: InnerStrategy,
+    }
+}
 
 impl Parser {
-    pub fn new() -> Self {
-        Self {}
+    pub fn nested() -> Self {
+        Self {
+            strategy: Strategy::Nested {
+                outer: InnerStrategy::Json,
+                inner: InnerStrategy::Logfmt,
+            }
+        }
+    }
+
+    pub fn new(strategy: Strategy) -> Self {
+        Self { strategy }
     }
 
     pub fn parse(&self, line: String) -> Result<Log> {
-        let mut log: Log = serde_json::from_str(&line)?;
-        let log2 = parse_logfmt(std::mem::replace(&mut log.message, "".to_string())).unwrap();
-        log.data.extend(log2.data);
-        log.name = log2.name;
-        if log.level.is_none() {
-            log.level = log2.level;
+        fn parse(line: String, strategy: InnerStrategy) -> Result<Log> {
+            use InnerStrategy::*;
+            match strategy {
+                Json => serde_json::from_str(&line).map_err(|e| e.into()),
+                Logfmt => parse_logfmt(line)
+            }
         }
-        log.message = log2.message;
-        Ok(log)
+
+        match self.strategy {
+            Strategy::Direct(s) => parse(line, s),
+            Strategy::Nested { inner, outer } => {
+                let mut outer = parse(line, outer)?;
+                let line = std::mem::replace(&mut outer.message, "".to_string());
+                let inner = parse(line, inner)?;
+                outer.data.extend(inner.data);
+                outer.name = inner.name;
+                if outer.level.is_none() {
+                    outer.level = inner.level;
+                }
+                outer.message = inner.message;
+                Ok(outer)
+            }
+        }
     }
 }
 
@@ -101,7 +140,7 @@ mod test {
         {"dt":"2023-06-04T01:42:46.344493Z","level":"info","message":"INFO server::onboarding::location_availability: Updated profile with postal code tz=America/Chicago area=- postal_code=10001 req=00djxys6h3gzskbwhwy5zk_pgkx user=7","platform":"Syslog","syslog":{"appname":"web-2q9fl","facility":"kern","host":"jyve-next","hostname":"jyve-next","msgid":"web-2q9fl","procid":1,"source_ip":"10.0.9.247","version":1}}
         "#.trim();
         _ = "INFO server::onboarding::location_availability: Updated profile with postal code tz=America/Chicago area=- postal_code=76133 req=00djxys6h3gzskbwhwy5zk_pgkx user=7";
-        let log = Parser.parse(json.to_string()).unwrap();
+        let log = Parser::nested().parse(json.to_string()).unwrap();
         assert_eq!(log.level, Some("info".to_string()));
         assert_eq!(log.name, Some("server::onboarding::location_availability".to_string()));
         assert_eq!(log.message, "Updated profile with postal code".to_string());
@@ -131,7 +170,7 @@ mod test {
         "version": 1
     }
 }"#;
-        let log = Parser.parse(json.to_string()).unwrap();
+        let log = Parser::nested().parse(json.to_string()).unwrap();
         assert_eq!(log.data["user"].to_string(), "db_user");
         assert_eq!(log.data["database"].to_string(), "foo");
         assert_eq!(log.data["port"].to_string(), "1");
@@ -159,7 +198,15 @@ mod test {
         "version": 1
     }
 }"#;
-        let log = Parser.parse(json.to_string()).unwrap();
+        let log = Parser::nested().parse(json.to_string()).unwrap();
         assert_eq!(log.data["latency"].to_string(), "100.32ms");
     }
+
+    // #[test]
+    // fn test_tracing_spans() {
+    //     let s = "2022-09-14T15:47:01.684149Z do_some_work{n=0}: close time.busy=110ms time.idle=5.10µs";
+    //     let log = Parser::new(Strategy::Direct(InnerStrategy::Logfmt)).parse(s.to_string()).unwrap();
+    //     println!("{:#?}", log);
+    //     assert_eq!(1, 0);
+    // }
 }
